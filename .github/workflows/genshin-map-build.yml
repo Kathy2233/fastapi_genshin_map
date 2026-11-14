@@ -1,0 +1,132 @@
+name: Build Genshin map images and sync to VPS
+
+on:
+  # Every 24 hours at 04:13 China Standard Time (20:13 UTC).
+  schedule:
+    - cron: '13 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: genshin-map-builder
+  cancel-in-progress: false
+
+jobs:
+  build-and-sync:
+    # Public repositories receive the standard 4-vCPU / 16-GB Linux runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      PYTHONUNBUFFERED: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Free unused runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Disk space before cleanup:'
+          df -h "$GITHUB_WORKSPACE"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          echo 'Disk space after cleanup:'
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Install project dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel --no-cache-dir
+          # The project pins an old FastAPI release. Keep Pydantic v1 and NumPy v1
+          # for compatibility with its source and older scientific dependencies.
+          python -m pip install --no-cache-dir -r requirements.txt 'pydantic<2' 'numpy<2'
+
+      - name: Verify Python dependencies and submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule status --recursive
+          python - <<'PY'
+          import aiohttp, aiofiles, fastapi, httpx, numpy, PIL, pydantic, scipy, sklearn, shapely, yaml
+          print('FastAPI:', fastapi.__version__)
+          print('Pydantic:', pydantic.__version__)
+          print('NumPy:', numpy.__version__)
+          print('SciPy:', scipy.__version__)
+          print('scikit-learn:', sklearn.__version__)
+          print('Pillow:', PIL.__version__)
+          print('All required imports succeeded.')
+          PY
+
+      - name: Generate map and resource images
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v python scripts/build_map.py
+
+      - name: Ensure rsync is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y rsync
+          fi
+          rsync --version | head -n 1
+
+      - name: Install SSH key and pinned host key
+        shell: bash
+        env:
+          GENSHIN_SSH_PRIVATE_KEY: ${{ secrets.GENSHIN_SSH_PRIVATE_KEY }}
+          GENSHIN_SSH_KNOWN_HOSTS: ${{ secrets.GENSHIN_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$GENSHIN_SSH_PRIVATE_KEY" || { echo 'Missing GENSHIN_SSH_PRIVATE_KEY'; exit 1; }
+          test -n "$GENSHIN_SSH_KNOWN_HOSTS" || { echo 'Missing GENSHIN_SSH_KNOWN_HOSTS'; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$GENSHIN_SSH_PRIVATE_KEY" | tr -d '\r' > "$HOME/.ssh/genshin_map_actions"
+          printf '%s\n' "$GENSHIN_SSH_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/genshin_map_actions" "$HOME/.ssh/known_hosts"
+          ssh-keygen -lf "$HOME/.ssh/known_hosts"
+
+      - name: Verify SSH access to destination VPS
+        shell: bash
+        env:
+          GENSHIN_SSH_HOST: ${{ secrets.GENSHIN_SSH_HOST }}
+          GENSHIN_SSH_PORT: ${{ secrets.GENSHIN_SSH_PORT }}
+          GENSHIN_SSH_USER: ${{ secrets.GENSHIN_SSH_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$GENSHIN_SSH_HOST"
+          test -n "$GENSHIN_SSH_PORT"
+          test -n "$GENSHIN_SSH_USER"
+          ssh -i "$HOME/.ssh/genshin_map_actions" \
+            -p "$GENSHIN_SSH_PORT" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "$GENSHIN_SSH_USER@$GENSHIN_SSH_HOST" \
+            'printf "SSH connection OK: "; hostname; test -w "$HOME/data/genshin-map"'
+
+      - name: Incrementally deploy images with rsync
+        shell: bash
+        env:
+          GENSHIN_SSH_HOST: ${{ secrets.GENSHIN_SSH_HOST }}
+          GENSHIN_SSH_PORT: ${{ secrets.GENSHIN_SSH_PORT }}
+          GENSHIN_SSH_USER: ${{ secrets.GENSHIN_SSH_USER }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: bash scripts/deploy_rsync.sh
