@@ -77,6 +77,7 @@ def apply_patches(repo_root: Path) -> None:
         "                        maps_data=maps,\n"
         "                        trees_data=trees,\n"
         "                        points_by_label_id=points_by_label_id,\n"
+        "                        base_map_data=map_img,\n"
         "                    )",
         label="pass cached map data to resource renderer",
     )
@@ -88,13 +89,15 @@ def apply_patches(repo_root: Path) -> None:
         "                tasks = []\n"
         "        await asyncio.gather(*tasks)",
         "            processed_resource_labels += 1\n"
-        "            if len(tasks) >= 2:\n"
+        "            if len(tasks) >= 1:\n"
         "                await asyncio.gather(*tasks)\n"
         "                tasks = []\n"
         "                logger.info(f\"[BUILD] {map_id.name}: {processed_resource_labels}/{total_resource_labels} categories processed\")\n"
         "        if tasks:\n"
         "            await asyncio.gather(*tasks)\n"
-        "        logger.info(f\"[BUILD] {map_id.name}: resource image generation finished ({processed_resource_labels}/{total_resource_labels})\")",
+        "        logger.info(f\"[BUILD] {map_id.name}: resource image generation finished ({processed_resource_labels}/{total_resource_labels})\")\n"
+        "        map_img.close()\n"
+        "        del map_img",
         label="limit concurrent image renders and report progress",
     )
 
@@ -107,6 +110,7 @@ def apply_patches(repo_root: Path) -> None:
         "    maps_data=None,\n"
         "    trees_data=None,\n"
         "    points_by_label_id=None,\n"
+        "    base_map_data=None,\n"
         ") -> Optional[Path]:",
         label="add optional cached data parameters",
     )
@@ -250,10 +254,12 @@ def apply_patches(repo_root: Path) -> None:
         "    genshin_map = genshin_map.crop(\n"
         "        (int(lt_point.x), int(lt_point.y), int(rb_point.x), int(rb_point.y))\n"
         "    )",
-        "    with Image.open(map_path) as base_map:\n"
-        "        genshin_map = base_map.crop(\n"
-        "            (int(lt_point.x), int(lt_point.y), int(rb_point.x), int(rb_point.y))\n"
-        "        )",
+        "    crop_box = (int(lt_point.x), int(lt_point.y), int(rb_point.x), int(rb_point.y))\n"
+        "    if base_map_data is not None:\n"
+        "        genshin_map = base_map_data.crop(crop_box)\n"
+        "    else:\n"
+        "        with Image.open(map_path) as base_map:\n"
+        "            genshin_map = base_map.crop(crop_box)",
         label="release full-map source after cropping",
     )
 
@@ -262,7 +268,9 @@ def apply_patches(repo_root: Path) -> None:
     print("  - removed full API JSON/point-list logging")
     print("  - fetched map metadata, labels, and points once per map")
     print("  - grouped points by label ID for fast reuse")
-    print("  - limited concurrent resource-image renders to 2")
+    print("  - limited concurrent resource-image renders to 1")
+    print("  - reused the in-memory full-resolution base map for all resource crops")
+    print("  - closed the full-resolution base map after each map is processed")
     print("  - cached icons/mark overlays and closed PIL images")
 
 
