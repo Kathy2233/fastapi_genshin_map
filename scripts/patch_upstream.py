@@ -263,6 +263,50 @@ def apply_patches(repo_root: Path) -> None:
         label="release full-map source after cropping",
     )
 
+    # Always pass an explicit L-mode alpha channel as the transparency mask.
+    # Some downloaded resource icons are palette/RGB images; using the whole
+    # image as the mask can raise Pillow's "bad transparency mask" ValueError.
+    source = replace_once(
+        source,
+        "        mark.paste(icon_pic, (25, 17), icon_pic)",
+        "        mark.paste(icon_pic, (25, 17), icon_pic.getchannel('A'))",
+        label="use explicit alpha channel for resource icon paste",
+    )
+
+    old_overlay_paste = "mark.paste(overlay, (13, 50), overlay)"
+    new_overlay_paste = "mark.paste(overlay, (13, 50), overlay.getchannel('A'))"
+    if new_overlay_paste not in source:
+        overlay_count = source.count(old_overlay_paste)
+        if overlay_count != 2:
+            raise RuntimeError(
+                "Cannot apply patch overlay alpha mask: expected exactly two "
+                f"overlay paste calls, found {overlay_count}. Refusing an unsafe edit."
+            )
+        source = source.replace(old_overlay_paste, new_overlay_paste)
+
+    old_mark_paste = """        genshin_map.paste(
+            mark,
+            (
+                point_trans[0] - mark_size[0] // 2,
+                point_trans[1] - mark_size[1],
+            ),
+            mark,
+        )"""
+    new_mark_paste = """        genshin_map.paste(
+            mark,
+            (
+                point_trans[0] - mark_size[0] // 2,
+                point_trans[1] - mark_size[1],
+            ),
+            mark.getchannel('A'),
+        )"""
+    source = replace_once(
+        source,
+        old_mark_paste,
+        new_mark_paste,
+        label="use explicit alpha channel for final resource marker paste",
+    )
+
     generator_path.write_text(source, encoding="utf-8")
     print("Applied GenshinMap build fixes:")
     print("  - removed full API JSON/point-list logging")
@@ -272,6 +316,7 @@ def apply_patches(repo_root: Path) -> None:
     print("  - reused the in-memory full-resolution base map for all resource crops")
     print("  - closed the full-resolution base map after each map is processed")
     print("  - cached icons/mark overlays and closed PIL images")
+    print("  - used explicit L-mode alpha masks for all resource-marker pastes")
 
 
 def main() -> int:
