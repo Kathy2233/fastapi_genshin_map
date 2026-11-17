@@ -100,10 +100,15 @@ async def create_genshin_map():
         points = await request.get_points(map_id)
         trees = await request.get_labels(map_id)
 
-        # 按 label_id 建立索引，避免每个资源分类重新遍历完整坐标列表。
-        points_by_label_id: dict[int, list] = {}
+        # 先按 label_id 分桶，再复用原版 utils.get_points_by_id 转换为 XYZSPoint 四元组。
+        raw_points_by_label: dict[int, list] = {}
         for point in points:
-            points_by_label_id.setdefault(point.label_id, []).append(point)
+            raw_points_by_label.setdefault(point.label_id, []).append(point)
+        points_by_label_id: dict[int, list] = {
+            label_id: utils.get_points_by_id(label_id, group)
+            for label_id, group in raw_points_by_label.items()
+        }
+        del raw_points_by_label
 
         mark_god = utils.get_points_by_id(2, points)
         mark_trans = utils.get_points_by_id(3, points)
