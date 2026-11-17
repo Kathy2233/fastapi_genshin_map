@@ -1,3 +1,7 @@
+# DIRECT_OPTIMIZED_MAP_GENERATOR
+# 地图生成器：直接在本文件内完成性能优化与 Pillow 透明度兼容。
+
+import asyncio
 import random
 from pathlib import Path
 from typing import Optional, Union
@@ -11,10 +15,11 @@ from .GenshinMap.genshinmap import img, models, request, utils
 from .logger import logger
 from .download import download_file, make_P0_map, update_world
 
-Image.MAX_IMAGE_PIXELS = 603120000
+# 当前项目使用的是可信地图资源，底图像素数超过 Pillow 默认安全阈值。
+Image.MAX_IMAGE_PIXELS = None
+
 router = APIRouter(prefix='/get_map')
 TEXT_PATH = Path(__file__).parent / 'texture2d'
-mark_quest = Image.open(TEXT_PATH / 'mark_quest.png').resize((32, 32))
 MAP = Path(__file__).parent / 'map_data'
 RESOURCE_PATH = Path(__file__).parent / 'resource_data'
 ICON_PATH = Path(__file__).parent / 'icon_data'
@@ -33,16 +38,43 @@ MAP_ID_DICT = {
     '40': models.MapID.frost_moon,  # 霜月
 }
 
-if not ICON_PATH.exists():
-    ICON_PATH.mkdir(exist_ok=True)
+for directory in (MAP, RESOURCE_PATH, ICON_PATH):
+    directory.mkdir(parents=True, exist_ok=True)
+
+# 小型纹理缓存：每个进程只解码一次，调用方使用 copy() 获取可修改副本。
+_TEMPLATE_CACHE: dict[str, Image.Image] = {}
 
 
-# 校验地图文件是否下载
-def check_map_file():
+def _load_rgba(path: Path) -> Image.Image:
+    """以独立 RGBA 图像读取纹理，兼容 RGB/RGBA/P/LA/L 等 PNG 模式。"""
+    with Image.open(path) as source:
+        return source.convert('RGBA')
+
+
+def _get_template(filename: str) -> Image.Image:
+    if filename not in _TEMPLATE_CACHE:
+        _TEMPLATE_CACHE[filename] = _load_rgba(TEXT_PATH / filename)
+    return _TEMPLATE_CACHE[filename]
+
+
+def paste_with_alpha(destination: Image.Image, source: Image.Image, position: tuple[int, int]) -> None:
+    """兼容各种 Pillow 图像模式，统一使用 L 模式 Alpha 通道作为 mask。"""
+    owns_rgba = source.mode != 'RGBA'
+    rgba = source.convert('RGBA') if owns_rgba else source
+    alpha = rgba.getchannel('A')
+    try:
+        destination.paste(rgba, position, alpha)
+    finally:
+        alpha.close()
+        if owns_rgba:
+            rgba.close()
+
+
+def check_map_file() -> bool:
     for map_id in MAP_ID_DICT.values():
         map_path = MAP / f'{map_id.name}.png'
-        if not map_path.exists():
-            logger.info(f'地图文件 {map_path} 不存在')
+        if not map_path.is_file() or map_path.stat().st_size == 0:
+            logger.info(f'地图文件 {map_path} 不存在或为空')
             return False
     return True
 
@@ -52,83 +84,93 @@ async def create_genshin_map():
     if check_map_file():
         logger.info('****************** 开始地图API服务 *****************')
         return
+
     logger.info('****************** 地图API服务进行初始化 *****************')
-    mark_god_pic = Image.open(TEXT_PATH / 'mark_god.png')
-    mark_trans_pic = Image.open(TEXT_PATH / 'mark_trans.png')
-
-    # 自动更新地图
     await update_world()
-    import asyncio
-
     await asyncio.sleep(2)
 
+    mark_god_template = _get_template('mark_god.png')
+    mark_trans_template = _get_template('mark_trans.png')
+
     for map_id in models.MapID:
+        logger.info(f'[BUILD] {map_id.name}: fetching map metadata, points and labels')
+
+        # 每张地图只请求一次地图信息、坐标点和标签树。
         maps = await request.get_maps(map_id)
         points = await request.get_points(map_id)
-        # 获取七天神像锚点
-        mark_god = utils.get_points_by_id(2, points)
-        # 获取传送锚点
-        mark_trans = utils.get_points_by_id(3, points)
-        # 转换两个锚点为标准坐标
-        mark_god_converted = utils.convert_pos(
-            mark_god,
-            maps.get_detail.origin,
-        )
-        mark_trans_converted = utils.convert_pos(
-            mark_trans,
-            maps.get_detail.origin,
-        )
-        maps = await request.get_maps(map_id)
-        # map_img = await utils.make_map(maps.detail)
-
-        # 自动制作地图
-        map_img = await make_P0_map(maps.id, maps.get_detail)
-
-        for mark_god_point in mark_god_converted:
-            map_img.paste(
-                mark_god_pic,
-                (int(mark_god_point.x) - 32, int(mark_god_point.y) - 64),
-                mark_god_pic,
-            )
-        for mark_trans_point in mark_trans_converted:
-            map_img.paste(
-                mark_trans_pic,
-                (int(mark_trans_point.x) - 32, int(mark_trans_point.y) - 64),
-                mark_trans_pic,
-            )
-        if not MAP.exists():
-            MAP.mkdir()
-        map_img.save(MAP / f'{map_id.name}.png')
-        logger.info('****************** 开始绘制 *****************')
         trees = await request.get_labels(map_id)
-        '''
-        for tree in trees:
-            for label in tree.children:
-                await get_map_response(
-                    'PRE-START',
-                    label.name,
-                    map_id,
-                    False,
-                )
-        '''
-        # 改成并发
-        import asyncio
 
-        tasks = []
-        for tree in trees:
-            for label in tree.children:
-                tasks.append(
-                    get_map_response(
+        # 按 label_id 建立索引，避免每个资源分类重新遍历完整坐标列表。
+        points_by_label_id: dict[int, list] = {}
+        for point in points:
+            points_by_label_id.setdefault(point.label_id, []).append(point)
+
+        mark_god = utils.get_points_by_id(2, points)
+        mark_trans = utils.get_points_by_id(3, points)
+        mark_god_converted = utils.convert_pos(mark_god, maps.get_detail.origin)
+        mark_trans_converted = utils.convert_pos(mark_trans, maps.get_detail.origin)
+
+        # 生成底图。转换为 RGB 后保存并复用同一个对象，降低常驻内存约 25%。
+        generated_map = await make_P0_map(maps.id, maps.get_detail)
+        if generated_map.mode == 'RGB':
+            # 已经是 RGB 时直接复用，避免再复制一份数 GiB 的底图。
+            base_map = generated_map
+            generated_map = None
+        else:
+            base_map = generated_map.convert('RGB')
+            generated_map.close()
+            generated_map = None
+
+        try:
+            for point in mark_god_converted:
+                paste_with_alpha(
+                    base_map,
+                    mark_god_template,
+                    (int(point.x) - 32, int(point.y) - 64),
+                )
+            for point in mark_trans_converted:
+                paste_with_alpha(
+                    base_map,
+                    mark_trans_template,
+                    (int(point.x) - 32, int(point.y) - 64),
+                )
+        except Exception:
+            base_map.close()
+            raise
+
+        try:
+            map_path = MAP / f'{map_id.name}.png'
+            base_map.save(map_path, format='PNG', optimize=False)
+            logger.info('****************** 开始绘制 *****************')
+
+            total = sum(len(tree.children) for tree in trees)
+            completed = 0
+            logger.info(f'[BUILD] {map_id.name}: {total} resource categories; render concurrency=1')
+
+            # 顺序生成，避免多个 768M 像素底图裁切任务同时占用内存。
+            for tree in trees:
+                for label in tree.children:
+                    await get_map_response(
                         'PRE-START',
                         label.name,
                         map_id,
                         False,
+                        maps_data=maps,
+                        trees_data=trees,
+                        points_by_label_id=points_by_label_id,
+                        base_map_data=base_map,
                     )
-                )
-            if len(tasks) > 10:
-                await asyncio.gather(*tasks)
-                tasks = []
-        await asyncio.gather(*tasks)
+                    completed += 1
+                    if completed % 25 == 0 or completed == total:
+                        logger.info(f'[BUILD] {map_id.name}: {completed}/{total} categories processed')
+
+            logger.info(f'[BUILD] {map_id.name}: resource image generation finished ({completed}/{total})')
+        finally:
+            base_map.close()
+
+        # 释放当前地图的大型 API 数据引用，再进入下一张地图。
+        del points_by_label_id, points, trees, maps
+
     logger.info('****************** 开始地图API服务 *****************')
 
 
@@ -137,168 +179,150 @@ async def get_map_response(
     resource_name: str,
     map_id: models.MapID,
     is_cluster: bool = False,
+    *,
+    maps_data=None,
+    trees_data=None,
+    points_by_label_id=None,
+    base_map_data: Optional[Image.Image] = None,
 ) -> Optional[Path]:
-    # 寻找主地图的缓存
-    map_path = MAP / f'{map_id.name}.png'
-    if '/' in resource_name:
-        resource_name = resource_name.replace('/', '_')
+    # 资源原名用于匹配 API 标签；清洗后的名称仅用于本地文件名。
+    lookup_name = resource_name
+    safe_name = resource_name.replace('/', '_')
 
-    # 寻找保存点
-    if not RESOURCE_PATH.exists():
-        RESOURCE_PATH.mkdir()
     if is_cluster:
-        save_path = RESOURCE_PATH / f'{map_id.name}_{resource_name}_KMEANS.jpg'
+        save_path = RESOURCE_PATH / f'{map_id.name}_{safe_name}_KMEANS.jpg'
     else:
-        save_path = RESOURCE_PATH / f'{map_id.name}_{resource_name}.jpg'
+        save_path = RESOURCE_PATH / f'{map_id.name}_{safe_name}.jpg'
 
-    # 如果存在缓存,直接回复
-    if save_path.exists():
+    if save_path.is_file() and save_path.stat().st_size > 0:
         logger.info(f'{prefix} [查询成功]：发送缓存 [{save_path.name}]！')
         return save_path
 
-    maps = await request.get_maps(map_id)
-    trees = await request.get_labels(map_id)
+    maps = maps_data if maps_data is not None else await request.get_maps(map_id)
+    trees = trees_data if trees_data is not None else await request.get_labels(map_id)
 
-    # 请求资源ID
     resource_id = 0
+    icon_url = None
     for tree in trees:
         for label in tree.children:
-            if resource_name == label.name:
+            if lookup_name == label.name:
                 resource_id = label.id
-                resource_name = label.name
-                icon = label.icon
+                icon_url = label.icon
                 break
-        else:
-            if resource_name == tree.name:
-                resource_id = tree.id
-                resource_name = tree.name
-                icon = tree.icon
-                break
+        if resource_id:
+            break
+        if lookup_name == tree.name:
+            resource_id = tree.id
+            icon_url = tree.icon
+            break
 
     if resource_id == 0:
-        return
+        return None
 
-    # 请求坐标点
-    points = await request.get_points(map_id)
-    transmittable = utils.get_points_by_id(resource_id, points)
+    if points_by_label_id is None:
+        points = await request.get_points(map_id)
+        transmittable = utils.get_points_by_id(resource_id, points)
+    else:
+        transmittable = points_by_label_id.get(resource_id, [])
 
-    # 转换坐标
-    transmittable_converted = utils.convert_pos(
-        transmittable,
-        maps.get_detail.origin,
-    )
+    transmittable_converted = utils.convert_pos(transmittable, maps.get_detail.origin)
+    if not transmittable_converted:
+        return None
 
-    # 进行最密点获取
     if is_cluster:
         group_point = img.k_means_points(transmittable_converted)
+        if not group_point:
+            return None
     else:
-        # 如果资源点不存在,返回错误
-        if len(transmittable_converted) == 0:
-            return
-        else:
-            # 计算极限坐标
-            up = 20000
-            down = 0
-            left = 20000
-            right = 0
-            for point in transmittable_converted:
-                if point.x >= right:
-                    right = point.x
-                if point.x <= left:
-                    left = point.x
-                if point.y >= down:
-                    down = point.y
-                if point.y <= up:
-                    up = point.y
-            offset = 100
-            group_point = [
-                [
-                    models.XYPoint(left - offset, up - offset),
-                    models.XYPoint(right + offset, down + offset),
-                    transmittable_converted,
-                ]
-            ]
+        up = min(point.y for point in transmittable_converted)
+        down = max(point.y for point in transmittable_converted)
+        left = min(point.x for point in transmittable_converted)
+        right = max(point.x for point in transmittable_converted)
+        offset = 100
+        group_point = [[
+            models.XYPoint(left - offset, up - offset),
+            models.XYPoint(right + offset, down + offset),
+            transmittable_converted,
+        ]]
 
     logger.info(f'{prefix} [新增缓存]：开始绘制 {save_path.name}...')
-    # 打开主地图
-    genshin_map = Image.open(map_path)
 
-    # 计算裁切点
     lt_point = group_point[0][0]
     rb_point = group_point[0][1]
-
-    # 增加裁切长宽
-    x = rb_point[0] - lt_point[0]
-    y = rb_point[1] - lt_point[1]
-    if x < 500 or y < 500:
+    width = rb_point.x - lt_point.x
+    height = rb_point.y - lt_point.y
+    if width < 500 or height < 500:
         lt_point = models.XYPoint(lt_point.x - 400, lt_point.y - 400)
         rb_point = models.XYPoint(rb_point.x + 400, rb_point.y + 400)
 
-    # 开始裁切
-    genshin_map = genshin_map.crop(
-        (int(lt_point.x), int(lt_point.y), int(rb_point.x), int(rb_point.y))
-    )
+    crop_box = (int(lt_point.x), int(lt_point.y), int(rb_point.x), int(rb_point.y))
+    if base_map_data is not None:
+        genshin_map = base_map_data.crop(crop_box)
+    else:
+        map_path = MAP / f'{map_id.name}.png'
+        with Image.open(map_path) as base_map:
+            genshin_map = base_map.crop(crop_box).convert('RGB')
 
-    # 在地图上绘制资源点
-    for point in group_point[0][2]:
-        point_trans = (
-            int(point.x) - int(lt_point.x),
-            int(point.y) - int(lt_point.y),
-        )
+    icon_path = ICON_PATH / f'{safe_name}.png'
+    if not icon_path.is_file() or icon_path.stat().st_size == 0:
+        if not icon_url:
+            genshin_map.close()
+            return None
+        await download_file(icon_url, icon_path)
 
-        icon_path = ICON_PATH / f'{resource_name}.png'
-        while True:
+    try:
+        with Image.open(icon_path) as icon_source:
+            icon_pic = icon_source.convert('RGBA').resize((52, 52))
+    except Exception:
+        icon_path.unlink(missing_ok=True)
+        if not icon_url:
+            genshin_map.close()
+            raise
+        await download_file(icon_url, icon_path)
+        with Image.open(icon_path) as icon_source:
+            icon_pic = icon_source.convert('RGBA').resize((52, 52))
+
+    try:
+        for point in group_point[0][2]:
+            point_trans = (
+                int(point.x) - int(lt_point.x),
+                int(point.y) - int(lt_point.y),
+            )
+
+            if point.s == 1:  # type: ignore
+                z = 1
+            else:
+                z = point.z  # type: ignore
+
+            mark_filename = f'mark_{z}.png' if z <= 3 else 'mark_B.png'
+            mark = _get_template(mark_filename).copy()
             try:
-                if not icon_path.exists():
-                    await download_file(icon, icon_path)
-                icon_pic = Image.open(icon_path).resize((52, 52))
-            except:  # noqa: E722
-                await download_file(icon, icon_path)
-                continue
-            break
+                if point.s == 1:  # type: ignore
+                    paste_with_alpha(mark, _get_template('B.png'), (13, 50))
+                elif point.s == 3:  # type: ignore
+                    paste_with_alpha(mark, _get_template('W.png'), (13, 50))
 
-        if point.s == 1:  # type: ignore
-            z = 1
-        else:
-            z = point.z  # type: ignore
+                paste_with_alpha(mark, icon_pic, (25, 17))
+                mark_resized = mark.resize((70, 70), Image.Resampling.LANCZOS)
+                try:
+                    paste_with_alpha(
+                        genshin_map,
+                        mark_resized,
+                        (
+                            point_trans[0] - 35,
+                            point_trans[1] - 70,
+                        ),
+                    )
+                finally:
+                    mark_resized.close()
+            finally:
+                mark.close()
 
-        if z <= 3:
-            mark = Image.open(TEXT_PATH / f'mark_{z}.png')
-        else:
-            mark = Image.open(TEXT_PATH / 'mark_B.png')
+        genshin_map.save(save_path, 'JPEG', quality=95)
+    finally:
+        genshin_map.close()
+        icon_pic.close()
 
-        _m = None
-        if point.s == 1:  # type: ignore
-            _m = Image.open(TEXT_PATH / 'B.png')
-        elif point.s == 3:  # type: ignore
-            _m = Image.open(TEXT_PATH / 'W.png')
-        if _m is not None:
-            mark.paste(_m, (13, 50), _m)
-
-        icon_pic = icon_pic.convert('RGBA')
-        mark.paste(icon_pic, (25, 17), icon_pic)
-
-        mark_size = (70, 70)
-        mark = mark.resize(mark_size)
-
-        genshin_map.paste(
-            mark,
-            (
-                point_trans[0] - mark_size[0] // 2,
-                point_trans[1] - mark_size[1],
-            ),
-            mark,
-        )
-
-    # 转换RGB图
-    genshin_map = genshin_map.convert('RGB')
-
-    # 转为Bytes,暂时废弃
-    # result_buffer = BytesIO()
-    # genshin_map.save(result_buffer, format='PNG', quality=80, subsampling=0)
-
-    # 进行保存
-    genshin_map.save(save_path, 'JPEG', quality=95)
     logger.info(f'{prefix} [查询成功]：新增缓存 [{save_path.name}]！')
     return save_path
 
@@ -311,47 +335,37 @@ async def get_map_by_point(
 ):
     req_id = random.randint(10000, 99999)
 
-    def resource_aliases_to_name(resource_name: str) -> str:
-        resource_name = resource_name.lower()
-        for m in resource_aliases:
-            for a in resource_aliases[m]:
-                if resource_name == a:
-                    return a
-                if resource_name in resource_aliases[m][a]:
-                    return a
-        return resource_name
+    def resource_aliases_to_name(name: str) -> str:
+        name = name.lower()
+        for group in resource_aliases:
+            for alias in resource_aliases[group]:
+                if name == alias or name in resource_aliases[group][alias]:
+                    return alias
+        return name
 
-    # 判断别名
     resource_name = resource_aliases_to_name(resource_name)
-
     prefix = f'>> [请求序列:{req_id}]'
     logger.info(
         f"{prefix} [查询请求]：在地图 ID {map_id or 'auto'} 内查询 {resource_name}..."
     )
 
     if map_id:
-        # 校验 map_id 有效性
-        if map_id not in MAP_ID_DICT:
+        map_key = str(map_id)
+        if map_key not in MAP_ID_DICT:
             logger.warning(f'{prefix} [失败]：地图 ID - {map_id} 不存在！')
-            return {
-                'retcode': -1,
-                'message': f'地图 ID - {map_id} 不存在！',
-            }
-        maps = [MAP_ID_DICT[str(map_id)]]
+            return {'retcode': -1, 'message': f'地图 ID - {map_id} 不存在！'}
+        maps = [MAP_ID_DICT[map_key]]
     else:
-        # 自动选择地图
         maps = list(MAP_ID_DICT.values())
 
-    for idx, map in enumerate(maps):
-        res = await get_map_response(prefix, resource_name, map, is_cluster)
-        if res:
-            return FileResponse(res)
+    for current_map in maps:
+        result = await get_map_response(prefix, resource_name, current_map, is_cluster)
+        if result:
+            return FileResponse(result)
         if len(maps) > 1:
             logger.info(
-                f'{prefix} [自动重试]：地图 ID {map._value_} 内不存在 {resource_name}...'
+                f'{prefix} [自动重试]：地图 ID {current_map._value_} 内不存在 {resource_name}...'
             )
+
     logger.warning(f'{prefix} [失败]：资源点 - {resource_name} 不存在！')
-    return {
-        'retcode': -1,
-        'message': f'资源点 - {resource_name} 不存在！',
-    }
+    return {'retcode': -1, 'message': f'资源点 - {resource_name} 不存在！'}
